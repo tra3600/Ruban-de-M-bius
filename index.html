@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ruban de Möbius interactif</title>
+<style>
+  :root{--bg:#0f1220;--fg:#e8ebf5;--mut:#9aa3c0;--card:#181c30}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif;display:flex;flex-direction:column;min-height:100vh}
+  header{padding:12px 16px}
+  h1{margin:0;font-size:1.2rem}
+  header p{margin:2px 0 0;color:var(--mut);font-size:.9rem}
+  main{flex:1;display:flex;flex-wrap:wrap;gap:12px;padding:0 16px 16px}
+  #wrap{flex:2 1 420px;min-height:360px;position:relative;background:var(--card);border-radius:12px;overflow:hidden}
+  canvas{width:100%;height:100%;display:block;touch-action:none;cursor:grab}
+  aside{flex:1 1 260px;background:var(--card);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:10px}
+  label{display:flex;justify-content:space-between;color:var(--mut);font-size:.85rem}
+  input[type=range]{width:100%}
+  .row{display:flex;gap:8px;flex-wrap:wrap}
+  button{background:#2a3157;color:var(--fg);border:0;border-radius:8px;padding:8px 12px;cursor:pointer;font:inherit}
+  button:hover{background:#38407a}
+  #msg{background:#10142a;border-radius:8px;padding:10px;font-size:.88rem;min-height:4.5em}
+  .k{color:#ff6b6b}
+</style>
+</head>
+<body>
+<header>
+  <h1>Ruban de Möbius</h1>
+  <p>Glissez pour tourner · molette pour zoomer · la fourmi parcourt la ligne médiane</p>
+</header>
+<main>
+  <div id="wrap"><canvas id="c"></canvas></div>
+  <aside>
+    <div><label>Largeur <span id="wv"></span></label><input id="w" type="range" min="0.05" max="0.7" step="0.01" value="0.3"></div>
+    <div><label>Demi-tours <span id="tv"></span></label><input id="t" type="range" min="0" max="5" step="1" value="1"></div>
+    <div><label>Vitesse de la fourmi</label><input id="s" type="range" min="0" max="3" step="0.1" value="1"></div>
+    <div class="row">
+      <button id="spin">Rotation auto : oui</button>
+      <button id="cut">Couper au milieu : non</button>
+      <button id="reset">Réinitialiser</button>
+    </div>
+    <div id="msg"></div>
+  </aside>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const cv = $("c"), ctx = cv.getContext("2d");
+const N = 160, M = 10, R = 1;
+const st = { w: .3, k: 1, speed: 1, spin: true, cut: false,
+             yaw: -.6, pitch: .9, zoom: 1, ant: 0, laps: 0, flips: 0 };
+
+// Surface : x=(R+v cos(ku/2))cos u, y=(R+v cos(ku/2)) sin u, z=v sin(ku/2)
+function P(u, v) {
+  const h = st.k * u / 2, r = R + v * Math.cos(h);
+  return [r * Math.cos(u), r * Math.sin(u), v * Math.sin(h)];
+}
+function normal(u, v) {
+  const e = 1e-4, a = P(u + e, v), b = P(u - e, v), c = P(u, v + e), d = P(u, v - e);
+  const du = a.map((x, i) => x - b[i]), dv = c.map((x, i) => x - d[i]);
+  const n = [du[1]*dv[2]-du[2]*dv[1], du[2]*dv[0]-du[0]*dv[2], du[0]*dv[1]-du[1]*dv[0]];
+  const l = Math.hypot(...n) || 1;
+  return n.map(x => x / l);
+}
+// Rotation puis projection perspective
+function view(p) {
+  const cy = Math.cos(st.yaw), sy = Math.sin(st.yaw), cp = Math.cos(st.pitch), sp = Math.sin(st.pitch);
+  let [x, y, z] = p;
+  [x, y] = [x*cy - y*sy, x*sy + y*cy];
+  [y, z] = [y*cp - z*sp, y*sp + z*cp];
+  return [x, y, z];
+}
+function proj(p) {
+  const [x, y, z] = view(p), d = 5, f = d / (d - y), s = Math.min(cv.width, cv.height) * .3 * st.zoom;
+  return [cv.width / 2 + x * f * s, cv.height / 2 - z * f * s, y];
+}
+function resize() {
+  const r = $("wrap").getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  cv.width = r.width * dpr; cv.height = r.height * dpr;
+}
+function hsl(u, l, a = 1) { return `hsla(${(u / (2*Math.PI) * 300 + 200) % 360},70%,${l}%,${a})`; }
+
+function draw() {
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  const quads = [], rows = M;
+  // coupe : on retire la bande centrale |v| < 0.02 et on sépare les deux moitiés
+  for (let i = 0; i < N; i++) {
+    const u0 = 2*Math.PI*i/N, u1 = 2*Math.PI*(i+1)/N;
+    const g = st.cut ? .05 * Math.min(1, st.cutAnim || 0) : 0;
+    const bands = g ? [[-st.w, -g], [g, st.w]] : [[-st.w, st.w]];
+    for (const [lo, hi] of bands) for (let j = 0; j < rows; j++) {
+      const v0 = lo + (hi-lo)*j/rows, v1 = lo + (hi-lo)*(j+1)/rows;
+      const pts = [P(u0, v0), P(u1, v0), P(u1, v1), P(u0, v1)];
+      const pp = pts.map(proj);
+      const n = normal((u0+u1)/2, (v0+v1)/2), vn = view(n);
+      const depth = (pp[0][2] + pp[1][2] + pp[2][2] + pp[3][2]) / 4;
+      quads.push({ pp, depth, shade: .5 + .5*Math.abs(vn[1]) , u: (u0+u1)/2, back: vn[1] > 0 });
+    }
+  }
+  quads.sort((a, b) => b.depth - a.depth);
+  for (const q of quads) {
+    ctx.beginPath(); q.pp.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.closePath();
+    ctx.fillStyle = hsl(q.u, 25 + 40 * q.shade, .95); ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,.12)"; ctx.lineWidth = .5; ctx.stroke();
+  }
+  // bord(s) en rouge
+  const cg = st.cut ? .05 * Math.min(1, st.cutAnim || 0) : 0;
+  const edgeV = [-st.w, st.w].concat(cg ? [-cg, cg] : []);
+  for (const s of edgeV) {
+    ctx.beginPath();
+    const turns = st.k % 2 && Math.abs(s) === st.w ? 2 : 1;
+    for (let i = 0; i <= N * turns; i++) {
+      const u = 2*Math.PI*i/N, p = proj(P(u, s));
+      i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]);
+    }
+    ctx.strokeStyle = "#ff5a5a"; ctx.lineWidth = 2.5; ctx.stroke();
+  }
+  // fourmi + normale
+  const u = st.ant, a = P(u, 0), n = normal(u, 0), tip = a.map((x, i) => x + .32 * n[i]);
+  const pa = proj(a), pt = proj(tip);
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pt[0], pt[1]); ctx.stroke();
+  ctx.fillStyle = "#ffd23f"; ctx.beginPath(); ctx.arc(pt[0], pt[1], 6, 0, 7); ctx.fill();
+  ctx.fillStyle = "#111"; ctx.beginPath(); ctx.arc(pa[0], pa[1], 4, 0, 7); ctx.fill();
+}
+
+function msg() {
+  const k = st.k, laps = st.laps;
+  const nbEdges = k % 2 ? 1 : 2, faces = k % 2 ? 1 : 2;
+  const n0 = normal(0, 0), n1 = normal(2*Math.PI, 0), dot = n0[0]*n1[0]+n0[1]*n1[1]+n0[2]*n1[2];
+  const type = k === 0 ? "cylindre" : k % 2 ? "ruban de Möbius" : "anneau tordu";
+  $("msg").innerHTML = `<b>${type}</b> — ${faces} face${faces>1?"s":""}, ${nbEdges} bord${nbEdges>1?"s":""}.<br>`
+    + `Après 1 tour, la normale (flèche) est ${dot < 0 ? '<span class="k">inversée</span> : la fourmi est « de l\'autre côté » sans avoir franchi de bord.' : "identique."}<br>`
+    + `Tours effectués : ${laps}` + (st.cut ? " · découpé : " + (k%2 ? "un seul ruban deux fois plus long, avec 2 demi-tours supplémentaires" : "deux rubans séparés") : "");
+}
+
+let last = performance.now();
+function frame(t) {
+  const dt = Math.min(.05, (t - last) / 1000); last = t;
+  if (st.spin && !drag) st.yaw += dt * .25;
+  const prev = st.ant;
+  st.ant += dt * st.speed;
+  if (st.ant >= 2*Math.PI) { st.ant -= 2*Math.PI; st.laps++; msg(); }
+  st.cutAnim = st.cut ? Math.min(1, (st.cutAnim||0) + dt*2) : 0;
+  draw(); requestAnimationFrame(frame);
+}
+
+// interactions
+let drag = false, lx = 0, ly = 0;
+cv.addEventListener("pointerdown", e => { drag = true; lx = e.clientX; ly = e.clientY; cv.setPointerCapture(e.pointerId); cv.style.cursor = "grabbing"; });
+cv.addEventListener("pointerup", () => { drag = false; cv.style.cursor = "grab"; });
+cv.addEventListener("pointermove", e => { if (!drag) return;
+  st.yaw += (e.clientX - lx) * .008; st.pitch = Math.max(-1.5, Math.min(1.5, st.pitch + (e.clientY - ly) * .008)); lx = e.clientX; ly = e.clientY; });
+cv.addEventListener("wheel", e => { e.preventDefault(); st.zoom = Math.max(.4, Math.min(3, st.zoom * (e.deltaY > 0 ? .93 : 1.07))); }, { passive: false });
+function sync() { $("wv").textContent = st.w.toFixed(2); $("tv").textContent = st.k; msg(); }
+$("w").oninput = e => { st.w = +e.target.value; sync(); };
+$("t").oninput = e => { st.k = +e.target.value; st.laps = 0; sync(); };
+$("s").oninput = e => st.speed = +e.target.value;
+$("spin").onclick = () => { st.spin = !st.spin; $("spin").textContent = "Rotation auto : " + (st.spin ? "oui" : "non"); };
+$("cut").onclick = () => { st.cut = !st.cut; $("cut").textContent = "Couper au milieu : " + (st.cut ? "oui" : "non"); msg(); };
+$("reset").onclick = () => { Object.assign(st, { yaw: -.6, pitch: .9, zoom: 1, ant: 0, laps: 0 }); sync(); };
+addEventListener("resize", resize);
+resize(); sync(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>
